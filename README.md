@@ -6,16 +6,26 @@ Chatbot RAG (vectorial + grafo) sobre la comunidad **"1. Publicaciones y eventos
 
 - `indexer/` — scripts Python (uv) de recolección e indexación
   - `harvest.py` — inventario de metadatos vía la API REST de DSpace 7 (`data/metadata.csv` / `.json`)
-  - `ingest.py` — (próximamente) descarga de PDFs, extracción por página e indexación con LightRAG
-- `apps/api/` — (próximamente) servicio de consulta FastAPI + LightRAG
-- `apps/web/` — (próximamente) chat Next.js + AI SDK (interfaz en español, modos vector/grafo)
+  - `ingest.py` — descarga de PDFs, extracción por página e indexación con LightRAG
+  - `providers.py` — configuración de proveedor LLM/embeddings (Gemini gratis u OpenAI)
+- `apps/api/` — servicio de consulta FastAPI + LightRAG (solo recuperación)
+- `apps/web/` — chat Next.js + AI SDK (interfaz en español, modos vector/grafo, citas con página)
 - `rag_storage/` — índice local de LightRAG (no versionado)
 
 ## Uso
 
 ```bash
-cd indexer
-uv run harvest.py
+# 1. Inventario de metadatos (sin API key)
+cd indexer && uv run harvest.py
+
+# 2. Indexación (requiere GEMINI_API_KEY u OPENAI_API_KEY en indexer/.env)
+cd indexer && uv run ingest.py --years 2026
+
+# 3. Servicio de consulta
+cd apps/api && uv run uvicorn main:app --port 8000
+
+# 4. Chat web (requiere apps/web/.env.local con GEMINI_API_KEY y RAG_API_URL)
+cd apps/web && npm run dev   # http://localhost:3000
 ```
 
 Por ahora todo corre en local; el despliegue (Vercel) y el almacenamiento gestionado quedan para una fase posterior.
