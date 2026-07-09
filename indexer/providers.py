@@ -38,7 +38,9 @@ PROVIDERS = {
         # tier 1 allows 500 RPM but only 200K TPM; extraction calls average
         # ~3K tokens, so 50/min keeps worst case near 165K TPM.
         "llm_rpm": 50,
-        "embed_tpm": 32_000,  # limit is 40K/min; char-based estimate is rough
+        # tier 1 embeddings: 1M TPM / 3K RPM (confirmed via response headers);
+        # 400K leaves ample margin for the rough char-based token estimate.
+        "embed_tpm": 400_000,
     },
     "gemini": {
         "api_key_env": "GEMINI_API_KEY",
