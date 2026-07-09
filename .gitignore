@@ -18,5 +18,8 @@ indexer/data/text/
 # LightRAG local index
 rag_storage/
 
+# local agent instructions
+CLAUDE.md
+
 # os
 .DS_Store
