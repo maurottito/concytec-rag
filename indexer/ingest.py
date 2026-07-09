@@ -193,6 +193,8 @@ def main() -> None:
     provider, cfg = resolve_provider()
     if not cfg["api_key"]:
         sys.exit(f"Falta {cfg['api_key_env']} en indexer/.env (proveedor: {provider})")
+    if not cfg["embed_api_key"]:
+        sys.exit(f"Falta la API key del proveedor de embeddings ({cfg['embed_provider']}) en indexer/.env")
     if not docs:
         sys.exit("No hay documentos indexables.")
     print(f"Proveedor: {provider} | LLM: {cfg['llm_model']} | Embeddings: {cfg['embed_model']}")

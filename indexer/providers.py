@@ -30,10 +30,13 @@ PROVIDERS = {
         "embed_price": 0.02,
         "max_async": 4,
         "max_gleaning": 1,
-        "embed_batch": 32,
-        "embed_max_async": 8,
+        # embeddings: 40K TPM / 100 RPM / 2K requests-per-DAY on this account
+        # (a batch counts as ONE request, unlike Gemini) — TPM is the binding
+        # limit, so batches of 16 x ~1200-token chunks pace against it.
+        "embed_batch": 16,
+        "embed_max_async": 1,
         "llm_rpm": 480,
-        "embed_rpm": 100,
+        "embed_tpm": 32_000,  # limit is 40K/min; char-based estimate is rough
     },
     "gemini": {
         "api_key_env": "GEMINI_API_KEY",
@@ -47,12 +50,12 @@ PROVIDERS = {
         "embed_price": 0.0,
         "max_async": 2,
         "max_gleaning": 0,  # 1 extraction call per chunk — halves quota burn
-        # 1K embedding requests/DAY is the scarcest quota, so batches are
-        # sizeable (8 x ~1200-token chunks ≈ 13K est tokens/request) and pacing
-        # spreads token volume evenly against the 30K TPM limit. Google meters
-        # on a sliding minute window, so any burst-capable limiter (leaky
-        # bucket) breaches it even when the average rate is under the cap —
-        # pacing must be even, with zero burst.
+        # WARNING: Gemini counts EVERY TEXT in a batch as one embedding
+        # request against its 100/min and 1,000/DAY free quotas, so batching
+        # saves nothing and any real corpus exhausts the daily cap. Use
+        # EMBED_PROVIDER=openai for actual indexing; this stays only for
+        # completeness. Google also meters on a sliding minute window, so
+        # pacing must be burst-free.
         "embed_batch": 8,
         "embed_max_async": 1,
         "llm_rpm": 12,  # limit is 15/min; leave headroom for retries
@@ -68,6 +71,24 @@ def resolve_provider() -> tuple[str, dict]:
     cfg = dict(PROVIDERS[name])
     cfg["llm_model"] = os.environ.get("LLM_MODEL", cfg["llm_model"])
     cfg["api_key"] = os.environ.get(cfg["api_key_env"])
+
+    # EMBED_PROVIDER splits embeddings off to another provider (e.g. free
+    # Gemini LLM + paid OpenAI embeddings — the Gemini free tier counts every
+    # text in a batch against its 1K/day embedding request quota, which makes
+    # it unusable beyond toy corpora). The index must always be queried with
+    # the same embedding model it was built with.
+    embed_name = os.environ.get("EMBED_PROVIDER", name)
+    if embed_name != name:
+        e = PROVIDERS[embed_name]
+        for k in ("embed_model", "embed_dim", "embed_price", "embed_batch",
+                  "embed_max_async", "embed_tpm"):
+            cfg[k] = e[k]
+        cfg["embed_base_url"] = e["base_url"]
+        cfg["embed_api_key"] = os.environ.get(e["api_key_env"])
+    else:
+        cfg["embed_base_url"] = cfg["base_url"]
+        cfg["embed_api_key"] = cfg["api_key"]
+    cfg["embed_provider"] = embed_name
     return name, cfg
 
 
@@ -90,32 +111,43 @@ def make_llm_func(provider: str, cfg: dict, token_tracker=None):
     return llm_model_func
 
 
+def _token_pacer(tpm: float):
+    """Even, burst-free pacing: each call reserves a time slot sized by its
+    estimated tokens (~3 chars/token for Spanish — overestimates, which is the
+    safe direction). A 1s floor between requests also keeps the request rate
+    under 60 RPM when batches are tiny (entity names during graph building).
+    Rate-limit windows slide, so bursts breach them even at a legal average
+    rate — this pacer never bursts."""
+    rate = tpm / 60  # tokens per second
+    next_slot = 0.0
+    lock = asyncio.Lock()
+
+    async def pace(texts: list[str]) -> None:
+        nonlocal next_slot
+        est_tokens = sum(len(t) // 3 + 16 for t in texts)
+        async with lock:
+            now = time.monotonic()
+            start = max(now, next_slot)
+            next_slot = start + max(est_tokens / rate, 1.0)
+            wait = start - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+
+    return pace
+
+
 def make_embedding_func(provider: str, cfg: dict, token_tracker=None):
     from lightrag.utils import EmbeddingFunc
 
-    if provider == "gemini":
+    pace = _token_pacer(cfg["embed_tpm"])
+
+    if cfg["embed_provider"] == "gemini":
         from google import genai
 
-        client = genai.Client(api_key=cfg["api_key"])
-        # Even, burst-free pacing: each batch reserves a time slot sized by its
-        # estimated tokens (~3 chars/token for Spanish — overestimates, which
-        # is the safe direction). A 1s floor between requests also keeps the
-        # request rate under the 100 RPM cap when batches are tiny (entity
-        # names during graph building).
-        rate = cfg["embed_tpm"] / 60  # tokens per second
-        next_slot = 0.0
-        slot_lock = asyncio.Lock()
+        client = genai.Client(api_key=cfg["embed_api_key"])
 
         async def embed(texts: list[str]) -> np.ndarray:
-            nonlocal next_slot
-            est_tokens = sum(len(t) // 3 + 16 for t in texts)
-            async with slot_lock:
-                now = time.monotonic()
-                start = max(now, next_slot)
-                next_slot = start + max(est_tokens / rate, 1.0)
-                wait = start - now
-            if wait > 0:
-                await asyncio.sleep(wait)
+            await pace(texts)
             res = await client.aio.models.embed_content(
                 model=cfg["embed_model"], contents=texts,
             )
@@ -128,14 +160,12 @@ def make_embedding_func(provider: str, cfg: dict, token_tracker=None):
     else:
         from lightrag.llm.openai import openai_embed
 
-        limiter = AsyncLimiter(cfg["embed_rpm"], 60)
-
         async def embed(texts: list[str]) -> np.ndarray:
-            async with limiter:
-                return await openai_embed(
-                    texts, model=cfg["embed_model"], base_url=cfg["base_url"],
-                    api_key=cfg["api_key"], token_tracker=token_tracker,
-                )
+            await pace(texts)
+            return await openai_embed(
+                texts, model=cfg["embed_model"], base_url=cfg["embed_base_url"],
+                api_key=cfg["embed_api_key"], token_tracker=token_tracker,
+            )
 
     return EmbeddingFunc(embedding_dim=cfg["embed_dim"], func=embed)
 
