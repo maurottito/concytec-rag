@@ -29,13 +29,15 @@ PROVIDERS = {
         "llm_price": (0.40, 1.60),  # USD per 1M tokens (input, output)
         "embed_price": 0.02,
         "max_async": 4,
-        "max_gleaning": 1,
+        "max_gleaning": 0,  # 1 extraction call per chunk; raise for graph quality at ~2x cost
         # embeddings: 40K TPM / 100 RPM / 2K requests-per-DAY on this account
         # (a batch counts as ONE request, unlike Gemini) — TPM is the binding
         # limit, so batches of 16 x ~1200-token chunks pace against it.
         "embed_batch": 16,
         "embed_max_async": 1,
-        "llm_rpm": 480,
+        # tier 1 allows 500 RPM but only 200K TPM; extraction calls average
+        # ~3K tokens, so 50/min keeps worst case near 165K TPM.
+        "llm_rpm": 50,
         "embed_tpm": 32_000,  # limit is 40K/min; char-based estimate is rough
     },
     "gemini": {

@@ -1,9 +1,9 @@
 import { streamText, convertToModelMessages, type UIMessage } from 'ai';
-import { createGoogleGenerativeAI } from '@ai-sdk/google';
+import { createOpenAI } from '@ai-sdk/openai';
 
-const google = createGoogleGenerativeAI({ apiKey: process.env.GEMINI_API_KEY });
+const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const RAG_API = process.env.RAG_API_URL ?? 'http://localhost:8000';
-const CHAT_MODEL = process.env.CHAT_MODEL ?? 'gemini-3.1-flash-lite';
+const CHAT_MODEL = process.env.CHAT_MODEL ?? 'gpt-4.1-mini';
 
 function systemPrompt(context: string): string {
   return `Eres el asistente del repositorio institucional del CONCYTEC (Consejo Nacional de Ciencia, Tecnología e Innovación Tecnológica del Perú), especializado en la colección "Publicaciones y eventos institucionales".
@@ -46,7 +46,7 @@ export async function POST(req: Request) {
   const { context } = (await res.json()) as { context: string };
 
   const result = streamText({
-    model: google(CHAT_MODEL),
+    model: openai(CHAT_MODEL),
     system: systemPrompt(context),
     messages: await convertToModelMessages(messages),
   });
