@@ -45,10 +45,13 @@ PROVIDERS = {
         "embed_price": 0.0,
         "max_async": 2,
         "max_gleaning": 0,  # 1 extraction call per chunk — halves quota burn
-        "embed_batch": 5,
+        # 1K embedding requests/DAY is the scarcest quota, so batches are big
+        # (16 x ~1200-token chunks ≈ 19K tokens/request) and pacing is done by
+        # a token bucket against the 30K TPM limit, not a request counter.
+        "embed_batch": 16,
         "embed_max_async": 1,
         "llm_rpm": 12,  # limit is 15/min; leave headroom for retries
-        "embed_rpm": 4,  # binding limit is 30K tokens/min ≈ 4 batches of 5 chunks
+        "embed_tpm": 24_000,
     },
 }
 
@@ -82,18 +85,19 @@ def make_llm_func(provider: str, cfg: dict, token_tracker=None):
 def make_embedding_func(provider: str, cfg: dict, token_tracker=None):
     from lightrag.utils import EmbeddingFunc
 
-    limiter = AsyncLimiter(cfg["embed_rpm"], 60)
-
     if provider == "gemini":
         from google import genai
 
         client = genai.Client(api_key=cfg["api_key"])
+        # token bucket: rough estimate 3 chars/token for Spanish text
+        token_bucket = AsyncLimiter(cfg["embed_tpm"], 60)
 
         async def embed(texts: list[str]) -> np.ndarray:
-            async with limiter:
-                res = await client.aio.models.embed_content(
-                    model=cfg["embed_model"], contents=texts,
-                )
+            est_tokens = min(sum(len(t) // 3 + 16 for t in texts), cfg["embed_tpm"])
+            await token_bucket.acquire(est_tokens)
+            res = await client.aio.models.embed_content(
+                model=cfg["embed_model"], contents=texts,
+            )
             if len(res.embeddings) != len(texts):
                 raise ValueError(
                     f"Gemini devolvió {len(res.embeddings)} vectores para {len(texts)} textos"
@@ -102,6 +106,8 @@ def make_embedding_func(provider: str, cfg: dict, token_tracker=None):
 
     else:
         from lightrag.llm.openai import openai_embed
+
+        limiter = AsyncLimiter(cfg["embed_rpm"], 60)
 
         async def embed(texts: list[str]) -> np.ndarray:
             async with limiter:
