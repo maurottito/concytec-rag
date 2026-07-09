@@ -3,7 +3,9 @@ name = "api"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
+    "aiolimiter>=1.2.1",
     "fastapi>=0.139.0",
+    "google-genai>=2.10.0",
     "lightrag-hku>=1.5.4",
     "openai>=2.44.0",
     "python-dotenv>=1.2.2",

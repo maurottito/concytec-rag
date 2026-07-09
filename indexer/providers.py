@@ -2,11 +2,20 @@
 
 The query service MUST use the same provider/embedding model the index was
 built with — embedding spaces are incompatible across models.
+
+Gemini specifics learned the hard way:
+- The free tier enforces 15 requests/MINUTE on the LLM, so calls go through an
+  AsyncLimiter window, not just a concurrency cap.
+- The OpenAI-compatible /embeddings endpoint returns a wrong vector count for
+  batched inputs, so embeddings use the native google-genai SDK instead.
 """
 
 from __future__ import annotations
 
 import os
+
+import numpy as np
+from aiolimiter import AsyncLimiter
 
 PROVIDERS = {
     "openai": {
@@ -20,6 +29,9 @@ PROVIDERS = {
         "max_async": 4,
         "max_gleaning": 1,
         "embed_batch": 32,
+        "embed_max_async": 8,
+        "llm_rpm": 480,
+        "embed_rpm": 100,
     },
     "gemini": {
         "api_key_env": "GEMINI_API_KEY",
@@ -31,11 +43,12 @@ PROVIDERS = {
         "embed_dim": 3072,
         "llm_price": (0.0, 0.0),  # free tier
         "embed_price": 0.0,
-        "max_async": 2,  # stay under 15 RPM; retries handle 429s
-        # 1 extraction call per chunk instead of 2 — halves the daily quota burn
-        "max_gleaning": 0,
-        # embeddings free tier is 30K TPM; 10 chunks x ~1200 tokens stays under
-        "embed_batch": 10,
+        "max_async": 2,
+        "max_gleaning": 0,  # 1 extraction call per chunk — halves quota burn
+        "embed_batch": 5,
+        "embed_max_async": 1,
+        "llm_rpm": 12,  # limit is 15/min; leave headroom for retries
+        "embed_rpm": 4,  # binding limit is 30K tokens/min ≈ 4 batches of 5 chunks
     },
 }
 
@@ -48,3 +61,74 @@ def resolve_provider() -> tuple[str, dict]:
     cfg["llm_model"] = os.environ.get("LLM_MODEL", cfg["llm_model"])
     cfg["api_key"] = os.environ.get(cfg["api_key_env"])
     return name, cfg
+
+
+def make_llm_func(provider: str, cfg: dict, token_tracker=None):
+    from lightrag.llm.openai import openai_complete_if_cache
+
+    limiter = AsyncLimiter(cfg["llm_rpm"], 60)
+
+    async def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
+        async with limiter:
+            return await openai_complete_if_cache(
+                cfg["llm_model"], prompt, system_prompt=system_prompt,
+                history_messages=history_messages, base_url=cfg["base_url"],
+                api_key=cfg["api_key"], token_tracker=token_tracker, **kwargs,
+            )
+
+    return llm_model_func
+
+
+def make_embedding_func(provider: str, cfg: dict, token_tracker=None):
+    from lightrag.utils import EmbeddingFunc
+
+    limiter = AsyncLimiter(cfg["embed_rpm"], 60)
+
+    if provider == "gemini":
+        from google import genai
+
+        client = genai.Client(api_key=cfg["api_key"])
+
+        async def embed(texts: list[str]) -> np.ndarray:
+            async with limiter:
+                res = await client.aio.models.embed_content(
+                    model=cfg["embed_model"], contents=texts,
+                )
+            if len(res.embeddings) != len(texts):
+                raise ValueError(
+                    f"Gemini devolvió {len(res.embeddings)} vectores para {len(texts)} textos"
+                )
+            return np.array([e.values for e in res.embeddings], dtype=np.float32)
+
+    else:
+        from lightrag.llm.openai import openai_embed
+
+        async def embed(texts: list[str]) -> np.ndarray:
+            async with limiter:
+                return await openai_embed(
+                    texts, model=cfg["embed_model"], base_url=cfg["base_url"],
+                    api_key=cfg["api_key"], token_tracker=token_tracker,
+                )
+
+    return EmbeddingFunc(embedding_dim=cfg["embed_dim"], func=embed)
+
+
+async def build_rag(working_dir: str, provider: str, cfg: dict,
+                    llm_tracker=None, embed_tracker=None):
+    """Create and initialize a LightRAG instance for this provider config."""
+    from lightrag import LightRAG
+    from lightrag.kg.shared_storage import initialize_pipeline_status
+
+    rag = LightRAG(
+        working_dir=working_dir,
+        llm_model_func=make_llm_func(provider, cfg, llm_tracker),
+        llm_model_name=cfg["llm_model"],
+        llm_model_max_async=cfg["max_async"],
+        entity_extract_max_gleaning=cfg["max_gleaning"],
+        embedding_batch_num=cfg["embed_batch"],
+        embedding_func_max_async=cfg["embed_max_async"],
+        embedding_func=make_embedding_func(provider, cfg, embed_tracker),
+    )
+    await rag.initialize_storages()
+    await initialize_pipeline_status()
+    return rag

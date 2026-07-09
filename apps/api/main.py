@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT / "indexer"))  # shared provider config
 load_dotenv(ROOT / "indexer" / ".env")
 
-from providers import resolve_provider  # noqa: E402
+from providers import build_rag, resolve_provider  # noqa: E402
 
 WORKING_DIR = ROOT / "rag_storage"
 
@@ -32,38 +32,13 @@ rag = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global rag
-    from lightrag import LightRAG
-    from lightrag.kg.shared_storage import initialize_pipeline_status
-    from lightrag.llm.openai import openai_complete_if_cache, openai_embed
-    from lightrag.utils import EmbeddingFunc
-
     provider, cfg = resolve_provider()
     if not cfg["api_key"]:
         raise RuntimeError(f"Falta {cfg['api_key_env']} en indexer/.env")
     if not WORKING_DIR.exists():
         raise RuntimeError("No existe rag_storage/ — ejecuta primero el indexado")
 
-    async def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
-        return await openai_complete_if_cache(
-            cfg["llm_model"], prompt, system_prompt=system_prompt,
-            history_messages=history_messages, base_url=cfg["base_url"],
-            api_key=cfg["api_key"], **kwargs,
-        )
-
-    rag = LightRAG(
-        working_dir=str(WORKING_DIR),
-        llm_model_func=llm_model_func,
-        llm_model_name=cfg["llm_model"],
-        embedding_func=EmbeddingFunc(
-            embedding_dim=cfg["embed_dim"],
-            func=lambda texts: openai_embed(
-                texts, model=cfg["embed_model"],
-                base_url=cfg["base_url"], api_key=cfg["api_key"],
-            ),
-        ),
-    )
-    await rag.initialize_storages()
-    await initialize_pipeline_status()
+    rag = await build_rag(str(WORKING_DIR), provider, cfg)
     yield
     await rag.finalize_storages()
 

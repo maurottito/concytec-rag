@@ -74,6 +74,10 @@ def download_pdfs(items: list[dict]) -> dict[str, list[Path]]:
                     print(f"    NO DESCARGABLE (HTTP {e.response.status_code}): {pdf['name']}")
                     dest.unlink(missing_ok=True)
                     paths[it["uuid"]].remove(dest)
+                except httpx.HTTPError as e:
+                    print(f"    NO DESCARGABLE ({type(e).__name__}): {pdf['name']}")
+                    dest.unlink(missing_ok=True)
+                    paths[it["uuid"]].remove(dest)
     return paths
 
 
@@ -117,38 +121,13 @@ def extract_document(item: dict, pdf_paths: list[Path]) -> tuple[str | None, int
 
 
 async def index_documents(docs: list[tuple[dict, str]], provider: str, cfg: dict) -> None:
-    from lightrag import LightRAG
-    from lightrag.kg.shared_storage import initialize_pipeline_status
-    from lightrag.llm.openai import openai_complete_if_cache, openai_embed
-    from lightrag.utils import EmbeddingFunc, TokenTracker
+    from lightrag.utils import TokenTracker
+
+    from providers import build_rag
 
     llm_tracker = TokenTracker()
     embed_tracker = TokenTracker()
-
-    async def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
-        return await openai_complete_if_cache(
-            cfg["llm_model"], prompt, system_prompt=system_prompt,
-            history_messages=history_messages, base_url=cfg["base_url"],
-            api_key=cfg["api_key"], token_tracker=llm_tracker, **kwargs,
-        )
-
-    rag = LightRAG(
-        working_dir=str(WORKING_DIR),
-        llm_model_func=llm_model_func,
-        llm_model_name=cfg["llm_model"],
-        llm_model_max_async=cfg["max_async"],
-        entity_extract_max_gleaning=cfg["max_gleaning"],
-        embedding_batch_num=cfg["embed_batch"],
-        embedding_func=EmbeddingFunc(
-            embedding_dim=cfg["embed_dim"],
-            func=lambda texts: openai_embed(
-                texts, model=cfg["embed_model"], base_url=cfg["base_url"],
-                api_key=cfg["api_key"], token_tracker=embed_tracker,
-            ),
-        ),
-    )
-    await rag.initialize_storages()
-    await initialize_pipeline_status()
+    rag = await build_rag(str(WORKING_DIR), provider, cfg, llm_tracker, embed_tracker)
 
     try:
         for i, (item, text) in enumerate(docs, 1):
