@@ -44,16 +44,24 @@ PROVIDERS = {
         "llm_price": (0.40, 1.60),  # USD per 1M tokens (input, output)
         "embed_price": 0.02,
         "max_async": 4,
+        "max_gleaning": 1,
+        "embed_batch": 32,
     },
     "gemini": {
         "api_key_env": "GEMINI_API_KEY",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "llm_model": "gemini-2.5-flash-lite",
-        "embed_model": "gemini-embedding-001",
+        # On this account's free tier only gemini-3.1-flash-lite has a usable
+        # daily quota (15 RPM / 500 RPD); 2.5/3/3.5 flash are capped at 20 RPD.
+        "llm_model": "gemini-3.1-flash-lite",
+        "embed_model": "gemini-embedding-001",  # free: 100 RPM / 30K TPM / 1K RPD
         "embed_dim": 3072,
         "llm_price": (0.0, 0.0),  # free tier
         "embed_price": 0.0,
-        "max_async": 2,  # free tier has low RPM; retries handle 429s
+        "max_async": 2,  # stay under 15 RPM; retries handle 429s
+        # 1 extraction call per chunk instead of 2 — halves the daily quota burn
+        "max_gleaning": 0,
+        # embeddings free tier is 30K TPM; 10 chunks x ~1200 tokens stays under
+        "embed_batch": 10,
     },
 }
 
@@ -170,6 +178,8 @@ async def index_documents(docs: list[tuple[dict, str]], provider: str, cfg: dict
         llm_model_func=llm_model_func,
         llm_model_name=cfg["llm_model"],
         llm_model_max_async=cfg["max_async"],
+        entity_extract_max_gleaning=cfg["max_gleaning"],
+        embedding_batch_num=cfg["embed_batch"],
         embedding_func=EmbeddingFunc(
             embedding_dim=cfg["embed_dim"],
             func=lambda texts: openai_embed(
