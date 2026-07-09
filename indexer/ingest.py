@@ -29,11 +29,43 @@ DATA_DIR = Path(__file__).parent / "data"
 PDF_DIR = DATA_DIR / "pdfs"
 WORKING_DIR = Path(__file__).parent.parent / "rag_storage"
 
-LLM_MODEL = "gpt-4.1-mini"
-EMBED_MODEL = "text-embedding-3-small"
-EMBED_DIM = 1536
-# USD per 1M tokens: (input, output)
-PRICES = {LLM_MODEL: (0.40, 1.60), EMBED_MODEL: (0.02, 0.0)}
+# Provider is chosen via LLM_PROVIDER in .env (default: gemini if GEMINI_API_KEY
+# is set, else openai). Gemini free tier costs $0 but is rate-limited and Google
+# may use free-tier content to improve its products (docs here are public/open).
+# IMPORTANT: the query API must use the same provider/embedding model as the
+# index was built with — embeddings are not interchangeable.
+PROVIDERS = {
+    "openai": {
+        "api_key_env": "OPENAI_API_KEY",
+        "base_url": None,
+        "llm_model": "gpt-4.1-mini",
+        "embed_model": "text-embedding-3-small",
+        "embed_dim": 1536,
+        "llm_price": (0.40, 1.60),  # USD per 1M tokens (input, output)
+        "embed_price": 0.02,
+        "max_async": 4,
+    },
+    "gemini": {
+        "api_key_env": "GEMINI_API_KEY",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "llm_model": "gemini-2.5-flash-lite",
+        "embed_model": "gemini-embedding-001",
+        "embed_dim": 3072,
+        "llm_price": (0.0, 0.0),  # free tier
+        "embed_price": 0.0,
+        "max_async": 2,  # free tier has low RPM; retries handle 429s
+    },
+}
+
+
+def resolve_provider() -> tuple[str, dict]:
+    name = os.environ.get("LLM_PROVIDER") or (
+        "gemini" if os.environ.get("GEMINI_API_KEY") else "openai"
+    )
+    cfg = dict(PROVIDERS[name])
+    cfg["llm_model"] = os.environ.get("LLM_MODEL", cfg["llm_model"])
+    cfg["api_key"] = os.environ.get(cfg["api_key_env"])
+    return name, cfg
 
 MIN_CHARS_PER_PAGE = 50  # below this average we assume a scanned/image PDF
 
@@ -117,7 +149,7 @@ def extract_document(item: dict, pdf_paths: list[Path]) -> tuple[str | None, int
     return "\n\n".join(pages), kept_pages, status
 
 
-async def index_documents(docs: list[tuple[dict, str]]) -> None:
+async def index_documents(docs: list[tuple[dict, str]], provider: str, cfg: dict) -> None:
     from lightrag import LightRAG
     from lightrag.kg.shared_storage import initialize_pipeline_status
     from lightrag.llm.openai import openai_complete_if_cache, openai_embed
@@ -128,17 +160,22 @@ async def index_documents(docs: list[tuple[dict, str]]) -> None:
 
     async def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
         return await openai_complete_if_cache(
-            LLM_MODEL, prompt, system_prompt=system_prompt,
-            history_messages=history_messages, token_tracker=llm_tracker, **kwargs,
+            cfg["llm_model"], prompt, system_prompt=system_prompt,
+            history_messages=history_messages, base_url=cfg["base_url"],
+            api_key=cfg["api_key"], token_tracker=llm_tracker, **kwargs,
         )
 
     rag = LightRAG(
         working_dir=str(WORKING_DIR),
         llm_model_func=llm_model_func,
-        llm_model_name=LLM_MODEL,
+        llm_model_name=cfg["llm_model"],
+        llm_model_max_async=cfg["max_async"],
         embedding_func=EmbeddingFunc(
-            embedding_dim=EMBED_DIM,
-            func=lambda texts: openai_embed(texts, model=EMBED_MODEL, token_tracker=embed_tracker),
+            embedding_dim=cfg["embed_dim"],
+            func=lambda texts: openai_embed(
+                texts, model=cfg["embed_model"], base_url=cfg["base_url"],
+                api_key=cfg["api_key"], token_tracker=embed_tracker,
+            ),
         ),
     )
     await rag.initialize_storages()
@@ -153,12 +190,13 @@ async def index_documents(docs: list[tuple[dict, str]]) -> None:
         await rag.finalize_storages()
 
     llm, emb = llm_tracker.get_usage(), embed_tracker.get_usage()
-    cost_llm = (llm["prompt_tokens"] * PRICES[LLM_MODEL][0]
-                + llm["completion_tokens"] * PRICES[LLM_MODEL][1]) / 1e6
-    cost_emb = emb["total_tokens"] * PRICES[EMBED_MODEL][0] / 1e6
+    cost_llm = (llm["prompt_tokens"] * cfg["llm_price"][0]
+                + llm["completion_tokens"] * cfg["llm_price"][1]) / 1e6
+    cost_emb = emb["total_tokens"] * cfg["embed_price"] / 1e6
     print("\n=== Uso de tokens ===")
-    print(f"LLM ({LLM_MODEL}): {llm}")
-    print(f"Embeddings ({EMBED_MODEL}): {emb}")
+    print(f"Proveedor: {provider}")
+    print(f"LLM ({cfg['llm_model']}): {llm}")
+    print(f"Embeddings ({cfg['embed_model']}): {emb}")
     print(f"Costo LLM: ${cost_llm:.2f} | Costo embeddings: ${cost_emb:.4f} | TOTAL: ${cost_llm + cost_emb:.2f}")
 
 
@@ -204,11 +242,13 @@ def main() -> None:
 
     if args.dry_run:
         return
-    if not os.environ.get("OPENAI_API_KEY"):
-        sys.exit("Falta OPENAI_API_KEY en indexer/.env")
+    provider, cfg = resolve_provider()
+    if not cfg["api_key"]:
+        sys.exit(f"Falta {cfg['api_key_env']} en indexer/.env (proveedor: {provider})")
     if not docs:
         sys.exit("No hay documentos indexables.")
-    asyncio.run(index_documents(docs))
+    print(f"Proveedor: {provider} | LLM: {cfg['llm_model']} | Embeddings: {cfg['embed_model']}")
+    asyncio.run(index_documents(docs, provider, cfg))
 
 
 if __name__ == "__main__":
