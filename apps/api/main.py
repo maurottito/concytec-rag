@@ -35,6 +35,11 @@ async def lifespan(app: FastAPI):
     provider, cfg = resolve_provider()
     if not cfg["api_key"]:
         raise RuntimeError(f"Falta {cfg['api_key_env']} en indexer/.env")
+    if not cfg["embed_api_key"]:
+        raise RuntimeError(
+            f"Falta la API key del proveedor de embeddings ({cfg['embed_provider']}) "
+            "en indexer/.env — las consultas se embeben con el mismo modelo del índice"
+        )
     if not WORKING_DIR.exists():
         raise RuntimeError("No existe rag_storage/ — ejecuta primero el indexado")
 
