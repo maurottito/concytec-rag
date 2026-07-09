@@ -12,7 +12,9 @@ Gemini specifics learned the hard way:
 
 from __future__ import annotations
 
+import asyncio
 import os
+import time
 
 import numpy as np
 from aiolimiter import AsyncLimiter
@@ -45,13 +47,16 @@ PROVIDERS = {
         "embed_price": 0.0,
         "max_async": 2,
         "max_gleaning": 0,  # 1 extraction call per chunk — halves quota burn
-        # 1K embedding requests/DAY is the scarcest quota, so batches are big
-        # (16 x ~1200-token chunks ≈ 19K tokens/request) and pacing is done by
-        # a token bucket against the 30K TPM limit, not a request counter.
-        "embed_batch": 16,
+        # 1K embedding requests/DAY is the scarcest quota, so batches are
+        # sizeable (8 x ~1200-token chunks ≈ 13K est tokens/request) and pacing
+        # spreads token volume evenly against the 30K TPM limit. Google meters
+        # on a sliding minute window, so any burst-capable limiter (leaky
+        # bucket) breaches it even when the average rate is under the cap —
+        # pacing must be even, with zero burst.
+        "embed_batch": 8,
         "embed_max_async": 1,
         "llm_rpm": 12,  # limit is 15/min; leave headroom for retries
-        "embed_tpm": 24_000,
+        "embed_tpm": 20_000,  # limit is 30K/min; char-based estimate is rough
     },
 }
 
@@ -69,7 +74,10 @@ def resolve_provider() -> tuple[str, dict]:
 def make_llm_func(provider: str, cfg: dict, token_tracker=None):
     from lightrag.llm.openai import openai_complete_if_cache
 
-    limiter = AsyncLimiter(cfg["llm_rpm"], 60)
+    # 1 request per (60/rpm)s instead of AsyncLimiter(rpm, 60): the latter
+    # allows an initial burst of `rpm` instant requests, which lands ~2x the
+    # cap inside Google's first minute window and triggers 429 retry storms.
+    limiter = AsyncLimiter(1, 60 / cfg["llm_rpm"])
 
     async def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
         async with limiter:
@@ -89,12 +97,25 @@ def make_embedding_func(provider: str, cfg: dict, token_tracker=None):
         from google import genai
 
         client = genai.Client(api_key=cfg["api_key"])
-        # token bucket: rough estimate 3 chars/token for Spanish text
-        token_bucket = AsyncLimiter(cfg["embed_tpm"], 60)
+        # Even, burst-free pacing: each batch reserves a time slot sized by its
+        # estimated tokens (~3 chars/token for Spanish — overestimates, which
+        # is the safe direction). A 1s floor between requests also keeps the
+        # request rate under the 100 RPM cap when batches are tiny (entity
+        # names during graph building).
+        rate = cfg["embed_tpm"] / 60  # tokens per second
+        next_slot = 0.0
+        slot_lock = asyncio.Lock()
 
         async def embed(texts: list[str]) -> np.ndarray:
-            est_tokens = min(sum(len(t) // 3 + 16 for t in texts), cfg["embed_tpm"])
-            await token_bucket.acquire(est_tokens)
+            nonlocal next_slot
+            est_tokens = sum(len(t) // 3 + 16 for t in texts)
+            async with slot_lock:
+                now = time.monotonic()
+                start = max(now, next_slot)
+                next_slot = start + max(est_tokens / rate, 1.0)
+                wait = start - now
+            if wait > 0:
+                await asyncio.sleep(wait)
             res = await client.aio.models.embed_content(
                 model=cfg["embed_model"], contents=texts,
             )
