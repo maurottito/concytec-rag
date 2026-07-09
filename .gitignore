@@ -1,0 +1,22 @@
+# secrets
+.env
+.env.*
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# node
+node_modules/
+.next/
+
+# data: PDFs are large; metadata inventory IS tracked
+indexer/data/pdfs/
+indexer/data/text/
+
+# LightRAG local index
+rag_storage/
+
+# os
+.DS_Store
