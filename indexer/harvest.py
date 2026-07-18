@@ -43,7 +43,7 @@ def fetch_page(page: int) -> dict:
             "dsoType": "item",
             "size": PAGE_SIZE,
             "page": page,
-            "embed": ["bundles/bitstreams/format", "owningCollection"],
+            "embed": ["bundles/bitstreams/format", "owningCollection", "metrics"],
         },
     )
     r.raise_for_status()
@@ -58,6 +58,18 @@ def bitstream_record(bs: dict) -> dict:
         "mimetype": fmt.get("mimetype"),
         "download_url": bs.get("_links", {}).get("content", {}).get("href"),
     }
+
+
+def parse_metrics(emb: dict) -> dict:
+    """CRIS stored metrics: snapshot of the view/download counters shown in the UI."""
+    metrics = (emb.get("metrics") or {}).get("_embedded", {}).get("metrics", [])
+    out = {"views": None, "downloads": None, "metrics_date": None}
+    for m in metrics:
+        key = {"view": "views", "download": "downloads"}.get(m.get("metricType"))
+        if key and m.get("metricCount") is not None:
+            out[key] = int(m["metricCount"])
+            out["metrics_date"] = (m.get("acquisitionDate") or "")[:10] or None
+    return out
 
 
 def parse_item(obj: dict) -> dict:
@@ -96,6 +108,13 @@ def parse_item(obj: dict) -> dict:
         "language": md(item, "dc.language.iso"),
         "collection": owning.get("name"),
         "abstract": md(item, "dc.description.abstract"),
+        "subjects": md(item, "dc.subject", first=False),
+        "subject_ocde": md(item, "dc.subject.ocde", first=False),
+        "publisher": md(item, "dc.publisher"),
+        "rights": md(item, "dc.rights"),
+        "rights_uri": md(item, "dc.rights.uri"),
+        "sponsorship": md(item, "dc.description.sponsorship", first=False),
+        **parse_metrics(emb),
         "pdfs": pdfs,
         "non_pdf_files": non_pdfs,
         "text_bitstreams": text,  # DSpace pre-extracted full text, may help scanned PDFs
@@ -131,13 +150,18 @@ def main() -> None:
         writer = csv.writer(f)
         writer.writerow(
             ["uuid", "year", "type", "collection", "title", "handle_url",
+             "views", "downloads", "subjects", "publisher", "rights_uri", "sponsorship",
              "pdf_count", "pdf_names", "pdf_mb", "pdf_urls", "non_pdf_count", "has_text_bundle"]
         )
         for it in items:
             pdf_mb = sum(b["size_bytes"] or 0 for b in it["pdfs"]) / 1e6
             writer.writerow(
                 [it["uuid"], it["year"], human_type(it["type"]), it["collection"],
-                 it["title"], it["handle_url"], len(it["pdfs"]),
+                 it["title"], it["handle_url"],
+                 it["views"], it["downloads"],
+                 "; ".join(it["subjects"] or []), it["publisher"], it["rights_uri"],
+                 "; ".join(it["sponsorship"] or []),
+                 len(it["pdfs"]),
                  "; ".join(b["name"] or "" for b in it["pdfs"]), f"{pdf_mb:.1f}",
                  "; ".join(b["download_url"] or "" for b in it["pdfs"]),
                  len(it["non_pdf_files"]), bool(it["text_bitstreams"])]
